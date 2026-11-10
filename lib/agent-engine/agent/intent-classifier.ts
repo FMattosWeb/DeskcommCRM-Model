@@ -14,20 +14,28 @@
  */
 import type pg from 'pg';
 
+import { extrairObjetoJsonDoTexto } from '@/lib/agent-engine/texto/extrair-json-do-texto';
+import { contextoDoClassificador, type ClassifierContextMessage } from '@/lib/ai/classifier-context';
+
 import type { Logger } from '../obs/logger';
 import { runModelCall, type LlmEdgeConfig } from '../edge/llm/run-model-call';
+import { formatarFatosDoCrm, type FatosDoCrm } from './fatos-do-crm-do-contato';
 import type { LoadedRouter, RouterMember } from './router-config';
 
 export interface IntentVerdict {
   intentName: string | null;
   confidence: number;
+  /**
+   * A saída não era uma resposta: sem JSON, JSON inválido, sem intenção, ou uma
+   * intenção fora da lista. O roteamento de hoje a lê como "nenhuma" (sticky ou
+   * `no_match`), e isso não muda; o que muda é que ninguém a trata como uma
+   * escolha da IA — o Jev decidindo não vale no lugar dela (R2), como na
+   * manipulação (`classifyJailbreak`, `falhou`).
+   */
+  falhou?: true;
 }
 
-/** Mensagem de contexto anterior à atual — só pra desambiguar, nunca o alvo da classificação. */
-export interface ClassifierContextMessage {
-  direction: 'inbound' | 'outbound';
-  body: string;
-}
+export type { ClassifierContextMessage } from '@/lib/ai/classifier-context';
 
 /** Instrução final fixa — pede JSON estrito, marcador estável pros testes/prompt. */
 const JSON_INSTRUCTION =
@@ -47,6 +55,12 @@ export function buildClassifierPrompt(
   members: RouterMember[],
   signal: string,
   recentMessages: ClassifierContextMessage[] = [],
+  /**
+   * Fatos do CRM do contato (#3917): funis/etapas com negócio ABERTO e
+   * etiquetas. Opcional — ausente ou vazio, o prompt é byte a byte o de antes,
+   * e o classificador segue decidindo pelo texto como sempre fez.
+   */
+  fatosDoCrm?: FatosDoCrm | null,
 ): string {
   const list = members
     .map((m) => {
@@ -59,15 +73,28 @@ export function buildClassifierPrompt(
       ? [
           '',
           'Contexto recente da conversa (mais antiga primeiro — só pra desambiguar, NÃO é o que classificar):',
-          ...recentMessages.map((m) => `${m.direction === 'inbound' ? 'Lead' : 'Agente'}: ${m.body}`),
+          ...contextoDoClassificador(recentMessages, 16).map((m) => `${m.direction === 'inbound' ? 'Lead' : 'Agente'}: ${m.body}`),
         ]
       : [];
+  // Entre o histórico e a mensagem: são fatos do CONTATO (quem ele é), não do
+  // turno. O cabeçalho diz em voz alta que não é o que se classifica, senão o
+  // modelo passa a responder sobre o funil em vez de escolher a intenção.
+  const textoDosFatos = formatarFatosDoCrm(fatosDoCrm);
+  const fatos =
+    textoDosFatos === ''
+      ? []
+      : [
+          '',
+          'Fatos do CRM deste contato (negócio ABERTO e etiquetas — contexto para decidir a intenção, NÃO é o que classificar):',
+          textoDosFatos,
+        ];
   return [
     'Você é um classificador auxiliar de intenção (NÃO responde ao lead).',
     'Intenções possíveis:',
     list,
     '- none: nenhuma das intenções acima se aplica.',
     ...contexto,
+    ...fatos,
     '',
     'Mensagem do lead a classificar:',
     signal,
@@ -77,34 +104,26 @@ export function buildClassifierPrompt(
 }
 
 /**
- * Parse tolerante (padrão de flywheel/live.ts): indexOf('{')/lastIndexOf('}') +
- * JSON.parse em try/catch. NUNCA lança — qualquer saída inesperada do modelo
+ * Parse tolerante via `extrairJsonDoTexto` (cerca de código, prosa em volta e
+ * repetição do objeto). NUNCA lança — qualquer saída inesperada do modelo
  * vira { intentName: null, confidence: 0 }. Intenção fora de `members` é
  * recusada (defesa contra alucinação): o chamador não pode rotear pra um
  * agentId que o parse inventou.
  */
 export function parseIntentVerdict(text: string, members: RouterMember[]): IntentVerdict {
-  const nullVerdict: IntentVerdict = { intentName: null, confidence: 0 };
-  const start = text.indexOf('{');
-  const end = text.lastIndexOf('}');
-  if (start === -1 || end <= start) return nullVerdict;
+  const nullVerdict: IntentVerdict = { intentName: null, confidence: 0, falhou: true };
 
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text.slice(start, end + 1));
-  } catch {
+  const parsed = extrairObjetoJsonDoTexto(text);
+  if (parsed === null || typeof parsed !== 'object') {
     return nullVerdict;
   }
-  if (typeof parsed !== 'object' || parsed === null) return nullVerdict;
-
   const raw = parsed as { intent?: unknown; confidence?: unknown };
   const confidence = typeof raw.confidence === 'number' && !Number.isNaN(raw.confidence)
     ? Math.min(1, Math.max(0, raw.confidence))
     : 0;
 
-  if (typeof raw.intent !== 'string' || raw.intent === 'none') {
-    return { intentName: null, confidence };
-  }
+  if (typeof raw.intent !== 'string') return nullVerdict;
+  if (raw.intent === 'none') return { intentName: null, confidence };
   const known = members.some((m) => m.intentName === raw.intent);
   if (!known) return nullVerdict;
 
@@ -129,6 +148,12 @@ export async function classifyIntent(
     signal: string;
     /** Últimas mensagens ANTERIORES ao signal, mais antiga → mais recente. Default []. */
     recentMessages?: ClassifierContextMessage[];
+    /**
+     * Fatos do CRM do contato (#3917). Quem lê o banco é o CHAMADOR
+     * (`resolve-turn-agent.ts`), não este módulo: a classificação de teste na UI
+     * pode não ter contato, e quem sabe se vale a consulta é o turno.
+     */
+    fatosDoCrm?: FatosDoCrm | null;
   },
   deps: ClassifyIntentDeps,
 ): Promise<IntentVerdict | null> {
@@ -154,7 +179,7 @@ export async function classifyIntent(
         messages: [
           {
             role: 'user',
-            content: buildClassifierPrompt(input.router.members, input.signal, input.recentMessages ?? []),
+            content: buildClassifierPrompt(input.router.members, input.signal, input.recentMessages ?? [], input.fatosDoCrm ?? null),
           },
         ],
       },

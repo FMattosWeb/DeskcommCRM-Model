@@ -27,11 +27,17 @@ interface Resposta {
   error: { message: string } | null;
 }
 interface Cenario {
+  /** Os `update` em `crm_leads`, na ordem (#3461: a posição de entrada). */
+  escritas?: unknown[];
+  /** O primeiro card da etapa de destino, lido para pôr o que chega no topo. */
+  topo?: Resposta;
   lead: Resposta;
   etapaDestino: Resposta;
   update: Resposta;
   rpcError?: { message: string } | null;
   etapaPorSlug?: (slug: string) => Resposta;
+  /** O `crm_pipelines.settings` que a régua de campos obrigatórios lê (#1536). */
+  funil?: Resposta;
 }
 
 function cenario(over: Partial<Cenario> = {}): Cenario {
@@ -59,22 +65,33 @@ function fakeAdmin(c: Cenario, rpcs: ChamadaRpc[] = []) {
       const b = {
         _update: false,
         _select: false,
+        _topo: false,
         _eqKeys: [] as string[],
         _slugVal: undefined as string | undefined,
         select: () => {
           b._select = true;
           return b;
         },
-        update: () => {
+        update: (payload?: unknown) => {
           b._update = true;
+          if (tabela === "crm_leads") c.escritas?.push(payload);
           return b;
         },
+        // A leitura do topo da etapa de destino (#3461): `.order().limit()`.
+        order: () => {
+          b._topo = true;
+          return b;
+        },
+        limit: () => b,
         eq: (key: string, val?: unknown) => {
           b._eqKeys.push(key);
           if (key === "slug" && typeof val === "string") b._slugVal = val;
           return b;
         },
         maybeSingle: () => {
+          if (tabela === "crm_pipelines")
+            return Promise.resolve(c.funil ?? { data: ETAPA_ORIGEM, error: null });
+          if (tabela === "crm_leads" && b._topo) return Promise.resolve(c.topo ?? { data: null, error: null });
           if (tabela === "crm_leads") return Promise.resolve(c.lead);
           if (b._eqKeys.includes("slug")) {
             if (c.etapaPorSlug && b._slugVal) return Promise.resolve(c.etapaPorSlug(b._slugVal));
@@ -112,6 +129,13 @@ async function moverObservando(c: Cenario, transicao: "pending" | "confirmed" = 
 
 describe("moverLeadParaEtapaDeAgendamento", () => {
   beforeEach(() => vi.mocked(emitLeadActivity).mockClear());
+
+  it("o card CHEGA no topo da etapa de destino (#3461)", async () => {
+    const escritas: unknown[] = [];
+    const r = await mover(cenario({ escritas, topo: { data: { position_in_stage: -3000 }, error: null } }));
+    expect(r).toMatchObject({ moveu: true });
+    expect(escritas).toEqual([expect.objectContaining({ position_in_stage: -4000 })]);
+  });
 
   it("caminho feliz: confirmado move para 'agendado' e emite atividade + evento", async () => {
     const { r, eventos } = await moverObservando(cenario(), "confirmed");
@@ -207,5 +231,57 @@ describe("moverLeadParaEtapaDeAgendamento", () => {
     const r = await mover(c, "pending");
     expect(r).toEqual({ moveu: false, motivo: "indisponivel" });
     expect(vi.mocked(emitLeadActivity)).not.toHaveBeenCalled();
+  });
+});
+
+/* ── A RÉGUA DE CAMPOS OBRIGATÓRIOS NO AGENDAMENTO (CR do mantenedor, #1536) ─ */
+
+/**
+ * Marcar um horário também grava `stage_id`: sem a pergunta aqui, a agenda
+ * seria a porta de trás da exigência declarada no funil. Mesmo desenho do
+ * arrasto — não move, devolve o motivo e o que falta em `detalhe`. A etapa de
+ * destino é UUID porque `obrigatorio_em.etapas` é `z.string().uuid()` e
+ * `camposDoFunil` descarta o campo quando o id não passa do parse.
+ */
+describe("moverLeadParaEtapaDeAgendamento e a régua de campos obrigatórios", () => {
+  beforeEach(() => vi.mocked(emitLeadActivity).mockClear());
+
+  const ETAPA_UUID = "99999999-9999-4999-8999-999999999999";
+  const destinoExigente = () =>
+    cenario({
+      etapaDestino: { data: { ...ETAPA_AGENDADO, id: ETAPA_UUID }, error: null },
+      funil: {
+        data: {
+          settings: {
+            fields: [
+              {
+                key: "concorrente",
+                label: "Concorrente",
+                type: "text",
+                obrigatorio_em: { etapas: [ETAPA_UUID] },
+              },
+            ],
+          },
+        },
+        error: null,
+      },
+    });
+
+  it("não move: devolve `campos_obrigatorios` com o que falta, sem gravar nada", async () => {
+    const r = await mover(destinoExigente());
+
+    expect(r).toEqual({
+      moveu: false,
+      motivo: "campos_obrigatorios",
+      detalhe: expect.stringContaining("Concorrente"),
+    });
+    expect(vi.mocked(emitLeadActivity)).not.toHaveBeenCalled();
+  });
+
+  it("funil SEM a exigência segue movendo como sempre (fail-open)", async () => {
+    const r = await mover(
+      cenario({ etapaDestino: { data: { ...ETAPA_AGENDADO, id: ETAPA_UUID }, error: null } }),
+    );
+    expect(r).toEqual({ moveu: true, motivo: "movido" });
   });
 });

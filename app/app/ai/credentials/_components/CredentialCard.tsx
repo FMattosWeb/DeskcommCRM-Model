@@ -36,6 +36,7 @@ import {
 } from "@/hooks/ai/useCredentials";
 import { useT } from "@/hooks/i18n/useT";
 import { ehProvedorDeDecisao, PROVEDORES_COM_CHAVE } from "@/lib/ai/pontos/provedores";
+import { PROVEDORES_DE_SERVICO } from "@/lib/ai/pontos/provedores-de-servico";
 import { descreverErroDeValidacao } from "@/lib/ai/credenciais/erro-de-validacao";
 import { RotateCredentialDialog } from "./RotateCredentialDialog";
 
@@ -48,8 +49,8 @@ interface Props {
    * trava a exclusão como `usageCount`: excluir desliga o Jev, e o diálogo avisa.
    */
   usadaEm?: readonly string[];
-  /** A frase do diálogo de exclusão para a chave do Jev em uso (ver `page.tsx`). */
-  avisoAoExcluir?: string;
+  /** As frases do diálogo de exclusão para a chave do Jev em uso (`avisoAoExcluirAChaveDoJev`). */
+  avisoAoExcluir?: readonly string[];
 }
 
 const STATUS_LABEL: Record<CredentialStatus, string> = {
@@ -80,7 +81,10 @@ export function CredentialCard({ credential, canWrite, usageCount, usadaEm = [],
   const last4 = credential.api_key_last4 ?? "????";
   const inUse = usageCount > 0;
   const erro = descreverErroDeValidacao(credential.validation_error, credential.provider);
-  const provedor = PROVEDORES_COM_CHAVE.find((p) => p.id === credential.provider);
+  const provedor =
+    PROVEDORES_COM_CHAVE.find((p) => p.id === credential.provider) ??
+    PROVEDORES_DE_SERVICO.find((p) => p.id === credential.provider);
+  const ehServicoDeVoz = PROVEDORES_DE_SERVICO.some((p) => p.id === credential.provider);
 
   const onRevalidate = () => {
     startTransition(async () => {
@@ -178,7 +182,7 @@ export function CredentialCard({ credential, canWrite, usageCount, usadaEm = [],
       {!ehProvedorDeDecisao(credential.provider) && (
         <dl className="grid grid-cols-2 gap-2 text-xs">
           <div>
-            <dt className="text-muted-foreground">{t("Modelos")}</dt>
+            <dt className="text-muted-foreground">{t(ehServicoDeVoz ? "Vozes" : "Modelos")}</dt>
             <dd className="font-mono">{credential.models_available?.length ?? "—"}</dd>
           </div>
           <div>
@@ -256,7 +260,7 @@ export function CredentialCard({ credential, canWrite, usageCount, usadaEm = [],
                   antiga ("agents vão falhar") descrevia um caso que não chega
                   aqui. O que sobra é o irreversível — e, na chave do Jev, que
                   não trava, o efeito de excluí-la (a rota o desliga). */}
-              {avisoAoExcluir && <>{t(avisoAoExcluir)} </>}
+              {avisoAoExcluir && <>{avisoAoExcluir.map((frase) => t(frase)).join(" ")} </>}
               {t("Esta ação não pode ser desfeita.")}
             </AlertDialogDescription>
           </AlertDialogHeader>

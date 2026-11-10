@@ -88,6 +88,9 @@ describe("visibleInboxTabs (lógica pura de visões)", () => {
   it("agent em 'own' NÃO vê 'all'", () => {
     expect(visibleInboxTabs("agent", "own")).not.toContain("all");
   });
+  it("agent em 'own_and_sector' VÊ 'all' (é onde aparece a conversa do colega do setor)", () => {
+    expect(visibleInboxTabs("agent", "own_and_sector")).toContain("all");
+  });
   it("agent em 'all' VÊ 'all'", () => {
     expect(visibleInboxTabs("agent", "all")).toContain("all");
   });
@@ -226,6 +229,10 @@ describe("InboxFilters — seletor de número e o filtro órfão", () => {
     render(
       <InboxFilters value={{ ...VALUE, tag: "etiqueta-orfa" }} onChange={() => {}} />,
     );
+    // ⚠️ `getByLabelText` continua valendo (#1274): o seletor deixou de ser um
+    // `Select` (que era `role="combobox"`) e virou um botão de menu, mas o RÓTULO
+    // ACESSÍVEL é o mesmo — e é por ele que se procura o controle, e por ele que
+    // o dicionário de tradução o indexa.
     const seletor = screen.getByLabelText("Filtrar por tag");
     expect(seletor).toBeInTheDocument();
     expect(seletor).toHaveTextContent("etiqueta-orfa");

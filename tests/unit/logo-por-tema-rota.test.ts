@@ -1,6 +1,7 @@
 // @vitest-environment node
 /** A rota real escolhe o campo, conserva o default legado e recusa tema antes de escrever. */
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { pedidoComTamanho } from "@/tests/helpers/pedido-com-tamanho";
 import { NextRequest } from "next/server";
 const mocks = vi.hoisted(() => ({
   user: { id: "11111111-1111-4111-8111-111111111111", is_platform_admin: false },
@@ -15,12 +16,28 @@ const mocks = vi.hoisted(() => ({
 const org = "22222222-2222-4222-8222-222222222222";
 vi.mock("@/lib/auth/server", () => ({
   loadAuthUser: async () => mocks.user,
-  resolveActiveOrg: async () => ({
+  orgAtivaSemPortao: async () => ({
     orgId: "22222222-2222-4222-8222-222222222222",
     role: mocks.role,
+    org_status: "active",
   }),
   mfaEmDivida: async () => false,
 }));
+vi.mock("@/lib/supabase/server", () => ({ createClient: vi.fn() }));
+vi.mock("@/lib/auth/requirePlatformAdmin", async (importOriginal) => {
+  const real = await importOriginal<typeof import("@/lib/auth/requirePlatformAdmin")>();
+  const { loadAuthUser: usuarioDoCaso } = await import("@/lib/auth/server");
+  return {
+    ...real,
+    // Segue o usuário do caso: o dono do servidor passa; os demais levam o
+    // redirect que o helper real faria. Scope e MFA: lib/auth/requirePlatformAdmin.test.ts.
+    requirePlatformAdminEscrita: async () => {
+      const u = await usuarioDoCaso();
+      if (!u?.is_platform_admin) throw new Error("NEXT_REDIRECT;/admin/forbidden");
+      return { user: { id: u.id }, platformAdmin: { user_id: u.id, scope: "full", mfa_required: false } };
+    },
+  };
+});
 vi.mock("@/lib/impersonate/support", () => ({ requireSupportWrite: async () => null }));
 vi.mock("@/lib/ai/dispatcher/rate-limit", () => ({
   checkRateLimit: async () => ({ allowed: true }),
@@ -53,7 +70,7 @@ beforeEach(() => {
   mocks.remove.mockResolvedValue({ error: null });
   mocks.audit.mockResolvedValue(undefined);
 });
-function post(tema?: string, escopo = "organizacao") {
+async function post(tema?: string, escopo = "organizacao") {
   const form = new FormData();
   form.set("escopo", escopo);
   if (tema !== undefined) form.set("tema", tema);
@@ -71,7 +88,7 @@ function post(tema?: string, escopo = "organizacao") {
     ),
   );
   return POST(
-    new NextRequest("http://localhost/api/v1/marca/logo", { method: "POST", body: form }),
+    await pedidoComTamanho("http://localhost/api/v1/marca/logo", { method: "POST", body: form }),
   );
 }
 describe("upload por tema", () => {

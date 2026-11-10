@@ -3,7 +3,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 
 import { createClient } from "@supabase/supabase-js";
-import { expect, test, type BrowserContext, type Page } from "@playwright/test";
+import { esperarARevelacaoNasCargas, expect, test, type BrowserContext, type Page } from "./helpers/test";
 
 import { credenciaisSupabaseDeTeste } from "../../scripts/lib/env-de-teste";
 
@@ -11,7 +11,7 @@ const credentials = credenciaisSupabaseDeTeste();
 const db = createClient(credentials.url, credentials.serviceRole, {
   auth: { persistSession: false },
 });
-const evidence = ".superpowers/evidence/comunidade-360";
+const evidence = "evidence/comunidade-360";
 
 test.use({ trace: "on" });
 test.describe.configure({ timeout: 180_000 });
@@ -181,6 +181,7 @@ test("configura responsáveis por canal e o cron distribui sem misturar números
     });
 
     context = await browser.newContext({ viewport: { width: 1440, height: 1000 } });
+    context.on("page", esperarARevelacaoNasCargas);
     const page = await context.newPage();
     await login(page, manager.email, password);
     await page.goto("/app/settings/atendimento");

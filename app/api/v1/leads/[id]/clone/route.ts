@@ -22,6 +22,13 @@ import { randomUUID } from "node:crypto";
 import { type NextRequest } from "next/server";
 
 import { createLeadHandler } from "@/app/api/v1/leads/_handler";
+import { ocultarProvaMetaNaResposta } from "@/lib/leads/prova-meta-lead-submitted";
+import { modoDeReabertura } from "@/lib/leads/reabertura";
+import {
+  recusaDeCamposObrigatorios,
+  settingsDoFunil,
+  validaCamposExigidos,
+} from "@/lib/leads/campos-exigidos";
 import { listPipelinesHandler } from "@/app/api/v1/pipelines/_handler";
 import type { HandlerCtx } from "@/lib/api/handlers/types";
 import { ApiError } from "@/lib/api/types";
@@ -52,6 +59,25 @@ import { createClient } from "@/lib/supabase/server";
 export const dynamic = "force-dynamic";
 
 /**
+ * A etapa como a tela de destino precisa dela: `id`/`name` para o seletor e os
+ * três campos que dizem se ela pode RECEBER o negócio. `is_archived` fica de
+ * fora porque o filtro é do banco (`.eq("is_archived", false)`): etapa arquivada
+ * não é escolha, nem como explicação.
+ */
+interface EtapaDeDestino {
+  id: string;
+  pipeline_id: string;
+  name: string;
+  /** `numeric` no Postgres chega como string pelo PostgREST. */
+  position: number | string;
+  is_won: boolean;
+  is_lost: boolean;
+}
+
+/** O que a tela recebe: sem `pipeline_id`, que já é a chave do funil na resposta. */
+type EtapaNaResposta = Omit<EtapaDeDestino, "pipeline_id">;
+
+/**
  * GET /api/v1/leads/[id]/clone — para ONDE este negócio pode ir.
  *
  * Exceção deliberada e MÍNIMA à matriz spec 13 §4 (pipelines read = manager+,
@@ -63,6 +89,18 @@ export const dynamic = "force-dynamic";
  * de gestão). O funil ATUAL do lead sai da lista — não é destino válido de troca
  * (a mesma regra de `recusaTrocaDeFunil`, medida aqui em vez de deixar a tela
  * descobrir só ao tentar).
+ *
+ * ── Por que as ETAPAS vêm junto (issue #3643) ────────────────────────────────
+ *
+ * O diálogo passou a pedir também a etapa de entrada, e a lista dela NÃO pode
+ * vir de `GET /api/v1/pipelines/:id/stages`: aquela rota é `manager`+ (é a tela
+ * de configuração do funil) e quem leva o card é `agent`. Com duas fontes, o
+ * vendedor veria o seletor de funil e nenhuma etapa — exatamente o operador que
+ * a issue quer atender. Aqui a leitura é a mesma de `id`/`name`: o nome da
+ * coluna já aparece para qualquer papel no quadro, e `position`/`is_won`/
+ * `is_lost` são o que a tela precisa para oferecer só etapa ABERTA (a mesma
+ * régua de `escolheEtapaDeDestino`, que continua sendo quem decide no POST).
+ * Uma chamada por abertura do diálogo, não uma por funil escolhido.
  */
 export async function GET(
   _req: NextRequest,
@@ -91,9 +129,41 @@ export async function GET(
     requestId,
   });
 
+  const idsDosDestinos = pipelines
+    .filter((p) => p.id !== (origem as { pipeline_id: string }).pipeline_id)
+    .map((p) => p.id);
+
+  // Funil único (instalação nova) não é erro: a tela explica que não há destino.
+  // Sem esta guarda o `.in("pipeline_id", [])` iria ao banco pedir nada.
+  const { data: etapas, error: stagesErr } =
+    idsDosDestinos.length === 0
+      ? { data: [] as EtapaDeDestino[], error: null }
+      : await supabase
+          .from("crm_stages")
+          .select("id, pipeline_id, name, position, is_won, is_lost")
+          .eq("organization_id", authz.org.orgId)
+          .in("pipeline_id", idsDosDestinos)
+          .eq("is_archived", false)
+          .order("position", { ascending: true });
+
+  if (stagesErr) return fail("internal_error", stagesErr.message, 500, { requestId });
+
+  const etapasPorFunil = new Map<string, EtapaNaResposta[]>();
+  for (const etapa of (etapas ?? []) as EtapaDeDestino[]) {
+    const lista = etapasPorFunil.get(etapa.pipeline_id) ?? [];
+    lista.push({
+      id: etapa.id,
+      name: etapa.name,
+      position: etapa.position,
+      is_won: etapa.is_won,
+      is_lost: etapa.is_lost,
+    });
+    etapasPorFunil.set(etapa.pipeline_id, lista);
+  }
+
   const destinos = pipelines
     .filter((p) => p.id !== (origem as { pipeline_id: string }).pipeline_id)
-    .map((p) => ({ id: p.id, name: p.name }));
+    .map((p) => ({ id: p.id, name: p.name, stages: etapasPorFunil.get(p.id) ?? [] }));
 
   return ok({ pipelines: destinos }, { requestId });
 }
@@ -155,7 +225,28 @@ export async function POST(
       return fail("pipeline_not_found", t(FUNIL_DE_DESTINO_NAO_ENCONTRADO), 404, { requestId });
     }
 
-    const recusa = recusaTrocaDeFunil(origem as OrigemParaClonar, input.pipeline_id);
+    // O funil de ORIGEM responde DUAS coisas antes da primeira escrita: se um
+    // encerrado pode ser clonado (issue #1538 — só num funil `novo_negocio`) e,
+    // abaixo, se o `lost_reason` do chamador está no vocabulário dele.
+    const { data: pipelineOrigem, error: origemPipeErr } = await supabase
+      .from("crm_pipelines")
+      .select("settings, name")
+      .eq("id", (origem as OrigemParaClonar).pipeline_id)
+      .eq("organization_id", handlerCtx.organization_id)
+      .maybeSingle();
+
+    if (origemPipeErr) {
+      return fail("internal_error", origemPipeErr.message, 500, { requestId });
+    }
+    const modoDaOrigem = modoDeReabertura(
+      (pipelineOrigem as { settings?: unknown } | null)?.settings,
+    );
+
+    const recusa = recusaTrocaDeFunil(
+      origem as OrigemParaClonar,
+      input.pipeline_id,
+      modoDaOrigem,
+    );
     if (recusa) {
       return fail(recusa.code, t(recusa.texto), recusa.status, { requestId });
     }
@@ -171,16 +262,6 @@ export async function POST(
     //
     // O vocabulário é o do funil de ORIGEM porque é a linha da origem que fecha,
     // e o trigger lê `new.pipeline_id` (supabase/baseline.sql).
-    const { data: pipelineOrigem, error: origemPipeErr } = await supabase
-      .from("crm_pipelines")
-      .select("settings, name")
-      .eq("id", (origem as OrigemParaClonar).pipeline_id)
-      .eq("organization_id", handlerCtx.organization_id)
-      .maybeSingle();
-
-    if (origemPipeErr) {
-      return fail("internal_error", origemPipeErr.message, 500, { requestId });
-    }
     const motivoRecusado = recusaDeMotivoForaDoVocabulario({
       motivo: input.lost_reason,
       settingsDoFunil: (pipelineOrigem as { settings?: unknown } | null)?.settings ?? null,
@@ -210,6 +291,50 @@ export async function POST(
       return fail(destino.code, t(destino.texto), destino.status, { requestId });
     }
 
+    // ── A ETAPA DE DESTINO TAMBÉM É UMA ENTRADA ────────────────────────────────
+    //
+    // O clone nasce numa etapa do funil de destino, e entrar nela é o mesmo
+    // gatilho do arrasto e da retomada: o funil que exige um campo para receber
+    // o negócio o exige aqui também. Sem esta pergunta, a troca de funil
+    // aterrissava numa etapa exigente com o campo em branco e a exigência só era
+    // cobrada na PRÓXIMA escrita — o negócio já estava lá.
+    //
+    // A régua é a MESMA função de todos os outros caminhos, e o valor que ela lê
+    // é o que o negócio novo VAI ter: o clone leva os campos personalizados da
+    // origem inteiros. A pergunta vem antes da primeira escrita, como todas as
+    // outras recusas desta rota — recusar depois deixaria o clone no destino e o
+    // 500 escondendo a meia-execução.
+    //
+    // O `settings` perguntado é o do funil de DESTINO: é onde o negócio entra. O
+    // `pipelineOrigem` logo acima é o da origem, e serviria à pergunta errada.
+    //
+    // O ARQUIVO não é cobrado aqui (#2829, fatia 2): este é um caminho de
+    // CRIAÇÃO — o negócio do destino ainda não existe, e o anexo mora em
+    // `crm_lead_attachments.lead_id`, que só pode receber upload depois. Sem
+    // `semAnexosAinda` a pergunta era mais dura que a do escritor logo abaixo
+    // (`createLeadHandler` já a faz com a opção, #3433): trocar de funil para uma
+    // etapa que exige documento respondia 422 para sempre, e o clone nunca
+    // acontecia. A cobrança volta no próximo move, no lote ou no fechamento —
+    // lá `camposComAnexo` é lido do banco.
+    const settingsDoDestino = await settingsDoFunil(supabase, destino.etapa.pipeline_id);
+    const vereditoDeCampos = validaCamposExigidos({
+      lead: { custom_fields: (origem as OrigemParaClonar).custom_fields ?? {} },
+      settingsDoFunil: settingsDoDestino,
+      destino: { stageId: destino.etapa.id, desfecho: null },
+      motivoDeGanho: null,
+      semAnexosAinda: true,
+    });
+    if (vereditoDeCampos.faltando.length > 0) {
+      const recusaDeCampos = recusaDeCamposObrigatorios(
+        vereditoDeCampos.faltando,
+        authz.user.idioma,
+      );
+      return fail(recusaDeCampos.codigo, recusaDeCampos.mensagem, 422, {
+        details: { faltando: vereditoDeCampos.faltando },
+        requestId,
+      });
+    }
+
     // ── A ORIGEM PRECISA TER ONDE FECHAR, E ISSO SE PERGUNTA ANTES ─────────────
     //
     // `encerraDemanda` recusa com 422 `pipeline_no_lost_stage` quando o funil de
@@ -223,26 +348,32 @@ export async function POST(
     // barata e não tem corrida que importe: se alguém arquivar a etapa entre esta
     // consulta e o encerramento, o 422 volta a acontecer — mas aí ele é honesto,
     // e a ordem "clone primeiro" continua sendo a certa pelo motivo do cabeçalho.
-    const { data: etapaDePerdaDaOrigem, error: perdaErr } = await supabase
-      .from("crm_stages")
-      .select("id")
-      .eq("organization_id", handlerCtx.organization_id)
-      .eq("pipeline_id", (origem as OrigemParaClonar).pipeline_id)
-      .eq("is_lost", true)
-      .eq("is_archived", false)
-      .limit(1)
-      .maybeSingle();
+    // Só a origem ABERTA precisa de onde fechar (issue #1538): a encerrada que
+    // o funil `novo_negocio` deixa clonar como nova tentativa não é reencerrada,
+    // e cobrar etapa de perda dela recusaria uma troca que não escreve nada.
+    const origemJaEncerrada = (origem as OrigemParaClonar).status !== "open";
+    if (!origemJaEncerrada) {
+      const { data: etapaDePerdaDaOrigem, error: perdaErr } = await supabase
+        .from("crm_stages")
+        .select("id")
+        .eq("organization_id", handlerCtx.organization_id)
+        .eq("pipeline_id", (origem as OrigemParaClonar).pipeline_id)
+        .eq("is_lost", true)
+        .eq("is_archived", false)
+        .limit(1)
+        .maybeSingle();
 
-    if (perdaErr) {
-      return fail("internal_error", perdaErr.message, 500, { requestId });
-    }
-    if (!etapaDePerdaDaOrigem) {
-      return fail(
-        "pipeline_no_lost_stage",
-        t(ORIGEM_SEM_ETAPA_DE_PERDA),
-        422,
-        { requestId },
-      );
+      if (perdaErr) {
+        return fail("internal_error", perdaErr.message, 500, { requestId });
+      }
+      if (!etapaDePerdaDaOrigem) {
+        return fail(
+          "pipeline_no_lost_stage",
+          t(ORIGEM_SEM_ETAPA_DE_PERDA),
+          422,
+          { requestId },
+        );
+      }
     }
 
     const clone = await createLeadHandler(
@@ -291,19 +422,32 @@ export async function POST(
       });
     }
 
-    const motivo = motivoDaPerdaDaOrigem(input.lost_reason);
-    const { lead: origemEncerrada } = await encerraDemanda(supabase, handlerCtx, {
-      leadId,
-      desfecho: "lost",
-      motivo,
-      razaoNaTimeline: nomeDoFunilDeDestino
-        ? `Levado para o funil ${nomeDoFunilDeDestino}`
-        : "Levado para outro funil",
-      payloadNaTimeline: {
-        to_pipeline_id: input.pipeline_id,
-        to_lead_id: destination.lead_id,
-      },
-    });
+    // ── A ORIGEM ENCRERRADA NÃO É REENCERRADA (issue #1538) ───────────────────
+    //
+    // Escrever `lost` por cima de `won` — ou por cima de `lost` com OUTRO motivo
+    // — apagaria o desfecho anterior, que é justamente metade do valor desta
+    // operação num funil `novo_negocio`: a primeira perda fica intocada, com o
+    // motivo dela, e o que a origem ganha é o ponteiro `movido_para` (logo
+    // abaixo) mais a linha do tempo do clone, já gravada acima.
+    const motivo = origemJaEncerrada
+      ? ((origem as { lost_reason?: string | null }).lost_reason ?? null)
+      : motivoDaPerdaDaOrigem(input.lost_reason);
+    let origemEncerrada: Record<string, unknown> | null = null;
+    if (!origemJaEncerrada) {
+      const encerrada = await encerraDemanda(supabase, handlerCtx, {
+        leadId,
+        desfecho: "lost",
+        motivo,
+        razaoNaTimeline: nomeDoFunilDeDestino
+          ? `Levado para o funil ${nomeDoFunilDeDestino}`
+          : "Levado para outro funil",
+        payloadNaTimeline: {
+          to_pipeline_id: input.pipeline_id,
+          to_lead_id: destination.lead_id,
+        },
+      });
+      origemEncerrada = encerrada.lead as Record<string, unknown>;
+    }
 
     // Onde a origem foi parar. Fica na ORIGEM porque o clone já carrega
     // `clonado_de`: cada lado guarda o ponteiro para o outro. É o dado para quem
@@ -349,7 +493,7 @@ export async function POST(
     return ok(
       {
         lead: clone,
-        origem: origemFinal ?? origemEncerrada,
+        origem: ocultarProvaMetaNaResposta((origemFinal ?? origemEncerrada ?? origem) as Record<string, unknown>),
       },
       { requestId, status: 201 },
     );

@@ -16,6 +16,7 @@ import {
   crmListConversations,
   crmGetConversation,
   crmGetConversationHistory,
+  crmCreateConversationDraft,
 } from "./conversations";
 import {
   crmListLeads,
@@ -23,14 +24,18 @@ import {
   crmCreateLead,
   crmUpdateLead,
   crmMoveLeadStage,
+  crmRetomarLead,
+  crmProposeLeadFieldsFromDocument,
 } from "./leads";
-import { crmListPipelines } from "./pipelines";
+import { crmGetPipelineForecast, crmListPipelines } from "./pipelines";
 import { crmSendWhatsappMessage } from "./messages";
+import { crmPublishWhatsappStatus } from "./status";
 import { crmStartConversationAndSend } from "./start-conversation";
 import {
   crmAssignConversation,
   crmManageTags,
   crmGetQueueStatus,
+  crmSetConversationSector,
 } from "./governance";
 import {
   crmListAvailableAttendants,
@@ -49,8 +54,11 @@ import {
   crmSaveOrgMemory,
 } from "./evolucao";
 import { crmListContactOrders, crmSearchProducts } from "./comercio";
+import { crmGetHonorariosContrato, crmListHonorariosParcelas } from "./honorarios";
 import { crmDescribeExternalData, crmQueryExternalData } from "./dados-externos";
+import { crmConsultarReceita } from "./receitas-externas";
 import { crmListPrivacyRequests } from "./privacidade";
+import { crmGetProspectingSiteAudit } from "./prospeccao-site";
 import {
   crmArchiveStage,
   crmCreateStage,
@@ -88,6 +96,7 @@ import {
   crmCloseDemand,
   crmProposeReactivation,
 } from "./retencao";
+import { crmDraftProposal, crmPrepararProposta } from "./propostas";
 
 // Cast via `unknown` porque McpToolDefinition<TInput> nao e covariante
 // em TInput (handler usa TInput em posicao contravariante). Coletar
@@ -109,6 +118,7 @@ export const allTools: ReadonlyArray<McpToolDefinition> = [
   crmListLeads,
   crmGetLead,
   crmListPipelines,
+  crmGetPipelineForecast,
   crmSearchKnowledge,
   crmListKnowledgeSources,
   crmListImprovementProposals,
@@ -116,9 +126,14 @@ export const allTools: ReadonlyArray<McpToolDefinition> = [
   crmSaveOrgMemory,
   crmListContactOrders,
   crmSearchProducts,
+  crmGetHonorariosContrato,
+  crmListHonorariosParcelas,
+  crmPrepararProposta,
   crmDescribeExternalData,
   crmQueryExternalData,
+  crmConsultarReceita,
   crmListPrivacyRequests,
+  crmGetProspectingSiteAudit,
   // read — organizar a operação (W4)
   crmListStages,
   crmListTags,
@@ -146,10 +161,19 @@ export const allTools: ReadonlyArray<McpToolDefinition> = [
   crmCreateLead,
   crmUpdateLead,
   crmMoveLeadStage,
+  crmRetomarLead,
+  crmProposeLeadFieldsFromDocument,
   crmSendWhatsappMessage,
+  // Status não é mensagem: não tem destinatário nem conversa, e quem publica
+  // escolhe um PÚBLICO. Vem logo depois do envio porque é a outra forma de
+  // alcançar o cliente pelo mesmo número.
+  crmPublishWhatsappStatus,
   crmStartConversationAndSend,
+  crmCreateConversationDraft,
   crmAssignConversation,
   crmManageTags,
+  // #3881 — a triagem da IA escolhe a FILA da conversa (módulo `setores`).
+  crmSetConversationSector,
   // write — organizar a operação (W4)
   crmCreateStage,
   crmUpdateStage,
@@ -165,6 +189,7 @@ export const allTools: ReadonlyArray<McpToolDefinition> = [
   crmAddCaseNote,
   crmCloseHumanCase,
   crmResumeAiAttendance,
+  crmDraftProposal,
   // handoff (special)
   crmRequestHumanHandoff,
 ] as unknown as ReadonlyArray<McpToolDefinition>;

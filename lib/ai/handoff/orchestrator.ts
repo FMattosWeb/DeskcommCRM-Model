@@ -234,6 +234,22 @@ export async function triggerHandoff(
       if (elegib !== null && !elegib.permite) {
         return { triggered: false, reason: `nao_elegivel:${elegib.motivo}` };
       }
+      // #3534 — CONTATO DA EQUIPE NÃO É PASSADO POR CLIMA. A régua é a mesma
+      // que o turno já usa (`settings.crm.team_contact_tags`), que aqui chega
+      // junto da decisão: o contato é ELEGÍVEL (a IA atende), e é isso que faz
+      // o guarda de elegibilidade acima deixá-lo passar. Só que passar por
+      // `low_sentiment` é o que silencia a conversa (`bot_silenced_until =
+      // 'infinity'`) e manda "já acionei o time" para quem É o time. O evento
+      // pode chegar por um alerta antigo, pelo Jev ou por outra origem: a
+      // recusa fica AQUI também, onde o silêncio de fato acontece, para que
+      // nenhum caminho de clima cale o contato da equipe.
+      if (input.reason === "low_sentiment" && elegib?.contatoDaEquipe === true) {
+        logger.info("[handoff] clima não passa contato da equipe", {
+          conversation_id: input.conversationId,
+          origem: input.origem,
+        });
+        return { triggered: false, reason: "contato_da_equipe:sem_repasse_por_clima" };
+      }
     } catch (err) {
       logger.warn("[handoff] elegibilidade indeterminada — handoff não disparado", {
         conversation_id: input.conversationId,
@@ -263,6 +279,7 @@ export async function triggerHandoff(
             conversationId: input.conversationId,
             contactId,
             reason: input.reason,
+            origem: input.origem,
             serviceBoundary: input.serviceBoundary,
           });
 
@@ -498,7 +515,9 @@ export async function triggerHandoff(
               organization_id: input.organizationId,
               kind: "handoff",
               severity: "critical",
-              title: "Atendimento automático parou — assumir a conversa",
+              // No idioma da ORGANIZAÇÃO, como o corpo: o título da Central sai
+              // como foi gravado (nunca passa por t() na tela).
+              title: traduzir("Atendimento automático parou — assumir a conversa", idiomaDaOrg),
               body: corpo,
               ref_kind: "conversation",
               ref_id: input.conversationId,

@@ -12,7 +12,7 @@ import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { test, expect, type Page } from "@playwright/test";
+import { test, expect, type Page } from "./helpers/test";
 import AxeBuilder from "@axe-core/playwright";
 
 import { afirmarAdminDeTenantPuro } from "./utils/precondicao";
@@ -124,7 +124,7 @@ test.describe("rbac role matrix (spec 13 §4)", () => {
     await expectNoBlockingA11y(page);
 
     await page.goto("/app/settings/billing");
-    await expect(page.getByRole("heading", { name: "Billing" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Plano e cobrança" })).toBeVisible();
     await expectNoBlockingA11y(page);
   });
 

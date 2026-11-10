@@ -91,7 +91,7 @@ vi.mock("@/hooks/i18n/useT", () => ({ useT: () => traduzir }));
 
 vi.mock("@/hooks/i18n/useLocaleDeData", async () => {
   const { ptBR } = await import("date-fns/locale");
-  return { useLocaleDeData: () => ptBR, useTagDeIdioma: "pt-BR" };
+  return { useLocaleDeData: () => ptBR, useTagDeIdioma: () => "pt-BR" };
 });
 
 /**
@@ -186,6 +186,7 @@ function montar() {
   const tela = () => (
     <QueryClientProvider client={cliente}>
       <AgendaClient
+        fusoDaAgenda="America/Sao_Paulo"
         fusoDeApresentacao="America/Sao_Paulo"
         hojeNaOrganizacao="2026-09-16"
         googleConfigurado={false}
